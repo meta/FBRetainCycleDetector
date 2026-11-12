@@ -63,6 +63,22 @@
   XCTAssertEqual([retainedObjects count], 0);
 }
 
+- (void)testBlockRetainsStrongObjectAlongsideScalarByref
+{
+  NSObject *object = [NSObject new];
+  __block int scalar = 42;
+  __attribute__((objc_precise_lifetime)) void (^block)() = [^{
+    __unused NSObject *capturedObject = object;
+    scalar += 1;
+  } copy];
+
+  NSArray *retainedObjects = FBGetBlockStrongReferences((__bridge void *)block);
+
+  XCTAssertEqualObjects(retainedObjects, (@[object]));
+  block();
+  XCTAssertEqual(scalar, 43);
+}
+
 - (void)testThatBlockRetainingVectorOfStructsDoNotCrash
 {
   struct HelperStruct {};
@@ -241,7 +257,7 @@ static const size_t kBlockLiteralHeaderSize = sizeof(void *) * 3 + sizeof(int) *
 // > 0x1000, non-tagged) base address. This reproduces the production race where a
 // capture slot holds a former-heap pointer whose target was freed / unmapped by
 // another thread: the value slips past the null / alignment / tagged-pointer
-// checks and is caught only by the vm_read_overwrite readability probe — the
+// checks and is caught only by the vm_region_64 readability probe — the
 // exact case the landed malloc_size guard does not handle. Caller must
 // vm_deallocate the returned page.
 static uintptr_t _ReserveInaccessiblePage(void)
@@ -341,6 +357,66 @@ static uintptr_t _ReserveInaccessiblePage(void)
                        @"Expected the torn slot to be counted as filtered");
   // Valid captures around the corrupted slot must still be returned.
   XCTAssertGreaterThanOrEqual([retainedObjects count], 16);
+}
+
+- (void)assertByrefCaptureIsFilteredAtAddress:(uintptr_t)address
+{
+  NSObject *strongObject = [NSObject new];
+  __block NSObject *byrefObject = [NSObject new];
+  void (^block)() = [^{
+    __unused NSObject *s = strongObject;
+    __unused NSObject *b = byrefObject;
+  } copy];
+
+  void *blockPtr = (__bridge void *)block;
+  uintptr_t *byrefSlot = (uintptr_t *)((uintptr_t)blockPtr + kBlockLiteralHeaderSize) + 1;
+  uintptr_t originalByref = *byrefSlot;
+  uint64_t filteredBefore = FBRCDFilteredCaptureSlotCount();
+  *byrefSlot = address;
+
+  NSArray *retainedObjects = nil;
+  @try {
+    retainedObjects = FBGetBlockStrongReferences(blockPtr);
+  } @finally {
+    *byrefSlot = originalByref;
+  }
+
+  XCTAssertEqualObjects(retainedObjects, (@[strongObject]));
+  XCTAssertGreaterThan(FBRCDFilteredCaptureSlotCount(), filteredBefore);
+}
+
+- (void)testCompactLayoutFiltersByrefAcrossUnreadablePageAndUnmappedGap
+{
+  vm_address_t address = 0;
+  kern_return_t kr = vm_allocate(mach_task_self(), &address, vm_page_size * 3, VM_FLAGS_ANYWHERE);
+  XCTAssertEqual(kr, KERN_SUCCESS);
+  if (kr != KERN_SUCCESS) {
+    return;
+  }
+
+  BOOL middlePageAllocated = YES;
+  @try {
+    kr = vm_protect(mach_task_self(), address + vm_page_size, vm_page_size, false, VM_PROT_NONE);
+    XCTAssertEqual(kr, KERN_SUCCESS);
+    if (kr != KERN_SUCCESS) {
+      return;
+    }
+    [self assertByrefCaptureIsFilteredAtAddress:address + vm_page_size - sizeof(void *)];
+
+    kr = vm_deallocate(mach_task_self(), address + vm_page_size, vm_page_size);
+    XCTAssertEqual(kr, KERN_SUCCESS);
+    if (kr != KERN_SUCCESS) {
+      return;
+    }
+    middlePageAllocated = NO;
+    [self assertByrefCaptureIsFilteredAtAddress:address + vm_page_size];
+  } @finally {
+    vm_deallocate(mach_task_self(), address, vm_page_size);
+    if (middlePageAllocated) {
+      vm_deallocate(mach_task_self(), address + vm_page_size, vm_page_size);
+    }
+    vm_deallocate(mach_task_self(), address + vm_page_size * 2, vm_page_size);
+  }
 }
 
 - (void)testCompactLayoutDoesNotCrashOnTornByrefSlot

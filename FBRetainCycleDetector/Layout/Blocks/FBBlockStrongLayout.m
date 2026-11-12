@@ -54,16 +54,10 @@ static void _NoteFilteredCaptureSlot(void) {
   }
 }
 
-// Probe `len` bytes at `ptr` via vm_read_overwrite. Kernel-mediated, so it
-// cannot itself fault on an invalid address — unlike malloc_size or a direct
-// dereference, which can crash on torn / freed memory.
 static BOOL _IsReadableMemory(const void *ptr, size_t len) {
   if (!ptr || (uintptr_t)ptr < 0x1000) {
     return NO;
   }
-  // Callers probe <= sizeof(scratch) bytes; clamp defensively. A larger request
-  // would only confirm the first 64 bytes are readable, so keep call-site sizes
-  // within this bound rather than relying on the clamp.
   uint8_t scratch[64];
   if (len > sizeof(scratch)) {
     len = sizeof(scratch);
@@ -79,7 +73,7 @@ static BOOL _IsReadableMemory(const void *ptr, size_t len) {
 }
 
 /**
- Validate that a raw pointer is safe to bridge to `id` and retain.
+ Apply best-effort checks before bridging a raw pointer to `id` and retaining it.
 
  Two distinct failure modes are guarded here:
   - Non-ObjC heap captures (e.g. Swift closure contexts). Bridging those to
@@ -88,14 +82,14 @@ static BOOL _IsReadableMemory(const void *ptr, size_t len) {
   - Torn / freed capture slots. RCD scans blocks on a background thread while
     other threads may be tearing down captures, so a slot can momentarily hold
     a torn or freed pointer. malloc_size / object_getClass are NOT safe on such
-    a pointer, so we first probe readability with vm_read_overwrite (which
-    cannot fault) before touching it.
+    a pointer. The read probe can reject inaccessible memory, but can itself
+    terminate under MIE on a tag mismatch; it is not a lifetime check.
 
  Validation chain:
   1. Non-null and above the reserved low page.
   2. Tagged pointers are always valid (decoded without a dereference).
   3. 8-byte aligned (all heap objects are).
-  4. Readable (torn / freed slots fail here).
+  4. The read probe succeeds.
   5. Non-heap pointers (e.g. global blocks in __DATA) are accepted — Swift
      capture boxes are always heap-allocated, so malloc_size == 0 is safe.
   6. For heap-allocated pointers, the ISA must be readable and resolve to a
@@ -104,8 +98,8 @@ static BOOL _IsReadableMemory(const void *ptr, size_t len) {
  The readability probe checks READ access at probe time only. It cannot close
  the inherent TOCTOU window against the teardown race, does not stop
  objc_retain's isa write from faulting on a read-only page, and still accepts a
- readable-but-non-object pointer (malloc_size == 0). This narrows the crash to a
- rare tail rather than eliminating it — RCD is a best-effort diagnostic.
+ readable-but-non-object pointer (malloc_size == 0). RCD is a best-effort
+ diagnostic, not a guarantee of safe access to arbitrary stale pointers.
  */
 static BOOL _FBIsRetainableObjCPointer(const void *ptr) {
   if (!ptr) {
@@ -208,15 +202,11 @@ static const char *_GetBlockDescriptorLayout(struct BlockLiteral *blockLiteral) 
   return *(const char **)desc;
 }
 
-// Extract the strong capture stored in a __block byref slot, guarding every
-// dereference so a torn byref pointer cannot crash the background scan.
 static void _AppendByrefStrongReference(void *rawByref, NSMutableArray *strongReferences) {
   if (!rawByref) {
     return;
   }
-  // Probe the Block_byref header before reading ->flags: a torn byref pointer
-  // (or malloc_size on it) would otherwise fault before any guard below runs.
-  if (!_IsReadableMemory(rawByref, sizeof(struct Block_byref))) {
+  if (!_IsReadableMemory(rawByref, offsetof(struct Block_byref, keep_helper))) {
     _NoteFilteredCaptureSlot();
     return;
   }
