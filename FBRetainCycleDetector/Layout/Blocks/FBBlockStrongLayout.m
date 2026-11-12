@@ -18,6 +18,16 @@
 #import <os/log.h>
 #import <stdatomic.h>
 
+#if defined(__arm64__) && defined(__LP64__) && __has_include(<os/security_config.h>) && __has_include(<arm64/mte.h>)
+#import <os/security_config.h>
+#pragma clang attribute push(__attribute__((target("memtag"))), apply_to=function)
+#import <arm64/mte.h>
+#pragma clang attribute pop
+#define FBRCD_HAS_MTE_PRECHECK 1
+#else
+#define FBRCD_HAS_MTE_PRECHECK 0
+#endif
+
 #import "FBBlockInterface.h"
 #import "FBBlockStrongRelationDetector.h"
 
@@ -52,6 +62,63 @@ static void _NoteFilteredCaptureSlot(void) {
     });
     os_log(sLog, "Filtered %{public}llu suspicious capture slots", (unsigned long long)total);
   }
+}
+
+#if FBRCD_HAS_MTE_PRECHECK
+__attribute__((target("memtag"), noinline))
+static uintptr_t _LoadAllocationTag(const void *ptr) {
+  return (uintptr_t)mte_load_tag((void *)ptr);
+}
+#endif
+
+static BOOL ismteenabled(void) {
+#if FBRCD_HAS_MTE_PRECHECK
+  if (@available(iOS 26.0, macOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *)) {
+    return (os_security_config_get() & OS_SECURITY_CONFIG_MTE) != 0;
+  }
+#endif
+  return NO;
+}
+
+static BOOL _HasReadableMatchingTags(const void *ptr, size_t len) {
+  if (!ismteenabled()) {
+    return YES;
+  }
+#if FBRCD_HAS_MTE_PRECHECK
+  const uintptr_t addressMask = UINT64_C(0x00FFFFFFFFFFFFFF);
+  const uintptr_t tagMask = UINT64_C(0x0F00000000000000);
+  uintptr_t address = (uintptr_t)ptr & addressMask;
+  if (address < 0x1000 || len > addressMask - address) {
+    return NO;
+  }
+  uintptr_t end = address + len;
+  uintptr_t cursor = address;
+  while (cursor < end) {
+    vm_address_t regionAddress = cursor;
+    vm_size_t regionSize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t objectName = MACH_PORT_NULL;
+    kern_return_t result = vm_region_64(mach_task_self(), &regionAddress, &regionSize,
+                                       VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                                       &count, &objectName);
+    if (objectName != MACH_PORT_NULL) {
+      mach_port_deallocate(mach_task_self(), objectName);
+    }
+    if (result != KERN_SUCCESS || regionAddress > cursor ||
+        !(info.protection & VM_PROT_READ) || cursor - regionAddress >= regionSize) {
+      return NO;
+    }
+    cursor += MIN(end - cursor, regionSize - (cursor - regionAddress));
+  }
+  for (uintptr_t granule = address & ~(uintptr_t)15; granule < end; granule += 16) {
+    const void *taggedGranule = (const void *)(((uintptr_t)ptr & ~addressMask) | granule);
+    if (((_LoadAllocationTag(taggedGranule) ^ (uintptr_t)ptr) & tagMask) != 0) {
+      return NO;
+    }
+  }
+#endif
+  return YES;
 }
 
 static BOOL _IsReadableMemory(const void *ptr, size_t len) {
@@ -131,7 +198,8 @@ static BOOL _FBIsRetainableObjCPointer(const void *ptr) {
 
   // Probe readability before any malloc_size / isa dereference — malloc_size
   // on freed memory is not guaranteed safe.
-  if (!_IsReadableMemory(ptr, sizeof(void *))) {
+  if (!_HasReadableMatchingTags(ptr, sizeof(void *)) ||
+      !_IsReadableMemory(ptr, sizeof(void *))) {
     _NoteFilteredCaptureSlot();
     return NO;
   }
@@ -151,7 +219,8 @@ static BOOL _FBIsRetainableObjCPointer(const void *ptr) {
     _NoteFilteredCaptureSlot();
     return NO;
   }
-  if (!_IsReadableMemory((__bridge const void *)cls, sizeof(void *))) {
+  if (!_HasReadableMatchingTags((__bridge const void *)cls, sizeof(void *)) ||
+      !_IsReadableMemory((__bridge const void *)cls, sizeof(void *))) {
     _NoteFilteredCaptureSlot();
     return NO;
   }
@@ -206,7 +275,8 @@ static void _AppendByrefStrongReference(void *rawByref, NSMutableArray *strongRe
   if (!rawByref) {
     return;
   }
-  if (!_IsReadableMemory(rawByref, offsetof(struct Block_byref, keep_helper))) {
+  if (!_HasReadableMatchingTags(rawByref, offsetof(struct Block_byref, keep_helper)) ||
+      !_IsReadableMemory(rawByref, offsetof(struct Block_byref, keep_helper))) {
     _NoteFilteredCaptureSlot();
     return;
   }
@@ -222,7 +292,8 @@ static void _AppendByrefStrongReference(void *rawByref, NSMutableArray *strongRe
   void *byrefDesc = (uint8_t *)blockByref + sizeof(*blockByref);
   // The captured object sits just past the header, outside the region probed
   // above — probe it separately before dereferencing.
-  if (!_IsReadableMemory(byrefDesc, sizeof(void *))) {
+  if (!_HasReadableMatchingTags(byrefDesc, sizeof(void *)) ||
+      !_IsReadableMemory(byrefDesc, sizeof(void *))) {
     _NoteFilteredCaptureSlot();
     return;
   }

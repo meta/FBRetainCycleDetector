@@ -14,12 +14,72 @@
 
 #import <mach/mach.h>
 
+#if defined(__arm64__) && defined(__LP64__) && __has_include(<os/security_config.h>)
+#import <os/security_config.h>
+#endif
+
 #import <FBRetainCycleDetector/FBBlockStrongLayout.h>
 #import <FBRetainCycleDetector/FBRetainCycleUtils.h>
 @interface FBBlockStrongLayoutTests : XCTestCase
 @end
 
 @implementation FBBlockStrongLayoutTests
+
+- (BOOL)isMTEEnabled
+{
+#if defined(__arm64__) && defined(__LP64__) && __has_include(<os/security_config.h>)
+  if (@available(iOS 26.0, macOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *)) {
+    return (os_security_config_get() & OS_SECURITY_CONFIG_MTE) != 0;
+  }
+#endif
+  return NO;
+}
+
+- (void)testMTEFiltersMismatchedStrongCapture
+{
+  XCTSkipIf(![self isMTEEnabled], @"Requires MTE enabled in the test process");
+  NSObject *object = [NSObject new];
+  __attribute__((objc_precise_lifetime)) void (^block)() = [^{
+    __unused NSObject *captured = object;
+  } copy];
+  void *blockPtr = (__bridge void *)block;
+  uintptr_t *slot = (uintptr_t *)((uint8_t *)blockPtr + sizeof(void *) * 3 + sizeof(int) * 2);
+  uintptr_t original = *slot;
+  uint64_t filteredBefore = FBRCDFilteredCaptureSlotCount();
+  *slot = original ^ (UINT64_C(1) << 56);
+  @try {
+    NSArray *references = FBGetBlockStrongReferences(blockPtr);
+    XCTAssertNotNil(references);
+    XCTAssertEqual(references.count, 0);
+    XCTAssertGreaterThan(FBRCDFilteredCaptureSlotCount(), filteredBefore);
+  } @finally {
+    *slot = original;
+  }
+  XCTAssertEqualObjects(FBGetBlockStrongReferences(blockPtr), (@[object]));
+}
+
+- (void)testMTEFiltersMismatchedByrefCapture
+{
+  XCTSkipIf(![self isMTEEnabled], @"Requires MTE enabled in the test process");
+  __block NSObject *object = [NSObject new];
+  __attribute__((objc_precise_lifetime)) void (^block)() = [^{
+    __unused NSObject *captured = object;
+  } copy];
+  void *blockPtr = (__bridge void *)block;
+  uintptr_t *slot = (uintptr_t *)((uint8_t *)blockPtr + sizeof(void *) * 3 + sizeof(int) * 2);
+  uintptr_t original = *slot;
+  uint64_t filteredBefore = FBRCDFilteredCaptureSlotCount();
+  *slot = original ^ (UINT64_C(1) << 56);
+  @try {
+    NSArray *references = FBGetBlockStrongReferences(blockPtr);
+    XCTAssertNotNil(references);
+    XCTAssertEqual(references.count, 0);
+    XCTAssertGreaterThan(FBRCDFilteredCaptureSlotCount(), filteredBefore);
+  } @finally {
+    *slot = original;
+  }
+  XCTAssertEqualObjects(FBGetBlockStrongReferences(blockPtr), (@[object]));
+}
 
 - (void)testBlockDoesntRetainWeakReference
 {
