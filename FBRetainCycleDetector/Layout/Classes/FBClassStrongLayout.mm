@@ -57,7 +57,7 @@ static NSArray *FBGetReferencesForObjectsInStructEncoding(FBIvarReference *ivar,
         NSGetSizeAndAlignment(typeEncoding.c_str(),
                               &size,
                               &align);
-      } @catch (NSException *e) {
+      } @catch (NSException *) {
         /**
          If we failed, we probably have C++ and ObjC cannot get it's size and alignment. We are skipping.
          If we would like to support it, we would need to derive size and alignment of type from the string.

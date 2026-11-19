@@ -139,7 +139,7 @@
           }
         }
       }
-      @catch (NSException *exception) {
+      @catch (NSException *) {
         // mutation happened, we want to try enumerating again
         continue;
       }
