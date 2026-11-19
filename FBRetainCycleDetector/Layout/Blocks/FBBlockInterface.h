@@ -19,7 +19,7 @@ enum { // Flags from BlockLiteral
   BLOCK_IS_GLOBAL =         (1 << 28),
   BLOCK_HAS_STRET =         (1 << 29), // IFF BLOCK_HAS_SIGNATURE
   BLOCK_HAS_SIGNATURE =     (1 << 30),
-  BLOCK_HAS_EXTENDED_LAYOUT=(1 << 31)  // compiler
+  BLOCK_HAS_EXTENDED_LAYOUT=(1U << 31)  // compiler
 };
 
 enum {
@@ -47,7 +47,7 @@ enum {
   // BLOCK_DEALLOCATING =      (0x0001),  // runtime
   // BLOCK_REFCOUNT_MASK =     (0xfffe),  // runtime
 
-  BLOCK_BYREF_LAYOUT_MASK =       (0xf << 28), // compiler
+  BLOCK_BYREF_LAYOUT_MASK =       (0xfU << 28), // compiler
   BLOCK_BYREF_LAYOUT_EXTENDED =   (  1 << 28), // compiler
   BLOCK_BYREF_LAYOUT_NON_OBJECT = (  2 << 28), // compiler
   BLOCK_BYREF_LAYOUT_STRONG =     (  3 << 28), // compiler
